@@ -19,7 +19,7 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 # =========================================================
 # Jakarta Fire-Air Quality Scenario Prediction Dashboard
-# GA2 Data Product Version 2
+# GA2 Data Product Version 3 with pollution severity gauges
 #
 # Main purpose:
 #   Train models using 2023 Jakarta air-quality and Indonesian fire data,
@@ -94,22 +94,42 @@ MODEL_DEFINITIONS = {
     ])
 }
 
+# Color scale for pollution communication.
+# The dashboard values are model outputs from the project dataset, not official AQI conversions.
+# These thresholds are used as an intuitive display scale for decision-support storytelling.
+POLLUTION_LEVELS = [
+    {"label": "Good", "low": 0, "high": 50, "color": "#00E400", "text_color": "#111111"},
+    {"label": "Moderate", "low": 50, "high": 100, "color": "#FFFF00", "text_color": "#111111"},
+    {"label": "Unhealthy for Sensitive Groups", "low": 100, "high": 150, "color": "#FF7E00", "text_color": "#111111"},
+    {"label": "Unhealthy", "low": 150, "high": 200, "color": "#FF0000", "text_color": "#FFFFFF"},
+    {"label": "Very Unhealthy", "low": 200, "high": 300, "color": "#8F3F97", "text_color": "#FFFFFF"},
+    {"label": "Hazardous", "low": 300, "high": 500, "color": "#7E0023", "text_color": "#FFFFFF"},
+]
+
+
+def pollution_level(value):
+    if pd.isna(value):
+        return {"label": "Not available", "color": "#D9D9D9", "text_color": "#111111"}
+    value = max(float(value), 0)
+    for level in POLLUTION_LEVELS:
+        if value <= level["high"]:
+            return level
+    return POLLUTION_LEVELS[-1]
+
 
 def pm25_risk_category(value):
-    if pd.isna(value):
-        return "Not available"
-    if value <= 50:
-        return "Good"
-    if value <= 100:
-        return "Moderate"
-    return "Unhealthy"
+    # Kept for compatibility with the report wording.
+    return pollution_level(value)["label"]
 
 
 def risk_message(category):
     messages = {
         "Good": "Predicted PM2.5 is Good. Routine monitoring is sufficient.",
         "Moderate": "Predicted PM2.5 is Moderate. Sensitive groups should pay attention.",
+        "Unhealthy for Sensitive Groups": "Predicted PM2.5 may affect sensitive groups. Prepare targeted advisory messages.",
         "Unhealthy": "Predicted PM2.5 is Unhealthy. Increase monitoring and prepare public health advisory.",
+        "Very Unhealthy": "Predicted PM2.5 is Very Unhealthy. Strengthen warnings and consider reducing outdoor exposure.",
+        "Hazardous": "Predicted PM2.5 is Hazardous. Issue urgent public health communication and coordinate response actions.",
         "Not available": "PM2.5 prediction is not available."
     }
     return messages.get(category, "Risk category unavailable.")
@@ -119,10 +139,89 @@ def suggested_action(category):
     if category == "Good":
         return "Routine monitoring. No special public warning is required."
     if category == "Moderate":
-        return "Continue monitoring. Prepare advisory messages for sensitive groups."
+        return "Continue monitoring and prepare advisory messages for highly sensitive groups."
+    if category == "Unhealthy for Sensitive Groups":
+        return "Increase attention to sensitive groups such as children, elderly people, outdoor workers, and people with respiratory disease."
     if category == "Unhealthy":
         return "Increase monitoring frequency, prepare public health advisory, and coordinate with related agencies."
+    if category == "Very Unhealthy":
+        return "Strengthen public warnings, reduce prolonged outdoor activity, and coordinate cross-agency response."
+    if category == "Hazardous":
+        return "Urgent public health communication is needed. Consider emergency response coordination and strong exposure-reduction advice."
     return "Prediction is not available."
+
+
+def pollutant_card(label, value):
+    level = pollution_level(value)
+    color = level["color"]
+    text_color = level["text_color"]
+    level_label = level["label"]
+    return f"""
+    <div style="background-color:{color}; color:{text_color};
+                padding:18px; border-radius:16px; text-align:center;
+                box-shadow:0 2px 8px rgba(0,0,0,0.12); min-height:145px;">
+        <div style="font-size:18px; font-weight:700; margin-bottom:8px;">{label}</div>
+        <div style="font-size:42px; font-weight:800; line-height:1;">{value:.2f}</div>
+        <div style="font-size:17px; font-weight:700; margin-top:10px;">{level_label}</div>
+    </div>
+    """
+
+
+def plot_pollution_gauge(value, title, max_value=300):
+    fig, ax = plt.subplots(figsize=(6.2, 3.4), subplot_kw={"aspect": "equal"})
+    capped_value = min(max(float(value), 0), max_value)
+
+    for level in POLLUTION_LEVELS:
+        lo = max(level["low"], 0)
+        hi = min(level["high"], max_value)
+        if lo >= max_value:
+            continue
+        theta1 = 180 - (hi / max_value) * 180
+        theta2 = 180 - (lo / max_value) * 180
+        wedge = plt.matplotlib.patches.Wedge(
+            (0, 0), 1.0, theta1, theta2, width=0.25,
+            facecolor=level["color"], edgecolor="white", linewidth=2
+        )
+        ax.add_patch(wedge)
+
+    angle = np.deg2rad(180 - (capped_value / max_value) * 180)
+    needle_x = 0.78 * np.cos(angle)
+    needle_y = 0.78 * np.sin(angle)
+    ax.plot([0, needle_x], [0, needle_y], linewidth=3, color="#222222")
+    ax.scatter([0], [0], s=80, color="#222222", zorder=5)
+
+    level = pollution_level(value)
+    ax.text(0, -0.18, f"{value:.2f}", ha="center", va="center", fontsize=22, fontweight="bold")
+    ax.text(0, -0.35, level["label"], ha="center", va="center", fontsize=11, fontweight="bold")
+    ax.text(0, 1.08, title, ha="center", va="center", fontsize=14, fontweight="bold")
+    ax.text(-1.0, -0.08, "0", ha="center", va="center", fontsize=9)
+    ax.text(1.0, -0.08, str(max_value), ha="center", va="center", fontsize=9)
+
+    ax.set_xlim(-1.15, 1.15)
+    ax.set_ylim(-0.45, 1.15)
+    ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def color_legend_html():
+    blocks = []
+    for level in POLLUTION_LEVELS[:-1]:
+        display_low = int(level["low"]) + 1 if level["low"] else 0
+        block = (
+            f'<span style="display:inline-block; background-color:{level["color"]}; color:{level["text_color"]}; '
+            f'padding:6px 10px; border-radius:10px; margin:3px; font-size:13px; font-weight:600;">'
+            f'{level["label"]}<br>{display_low}-{int(level["high"])}<span style="display:none"></span></span>'
+        )
+        blocks.append(block)
+    last = POLLUTION_LEVELS[-1]
+    blocks.append(
+        f'<span style="display:inline-block; background-color:{last["color"]}; color:{last["text_color"]}; '
+        f'padding:6px 10px; border-radius:10px; margin:3px; font-size:13px; font-weight:600;">'
+        f'Hazardous<br>301+</span>'
+    )
+    return "".join(blocks)
+
 
 
 @st.cache_data(show_spinner=False)
@@ -409,7 +508,8 @@ st.set_page_config(
 st.title("🔥 Jakarta Fire-Air Quality Scenario Prediction Dashboard")
 st.caption(
     "This data product trains regression models using the 2023 Jakarta air-quality and Indonesian fire dataset. "
-    "Users can input current or hypothetical fire indicators to predict expected PM2.5 and PM10 levels."
+    "Users can input current or hypothetical fire indicators to predict expected PM2.5 and PM10 levels. "
+    "The output uses an AQI-style color scale to make pollution severity easier to communicate."
 )
 
 with st.sidebar:
@@ -534,20 +634,42 @@ pred_pm10 = float(pm10_model.predict(scenario_input)[0])
 risk = pm25_risk_category(pred_pm25)
 
 st.markdown("### Prediction Output")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Selected Model", model_choice)
-m2.metric("Predicted PM2.5", f"{pred_pm25:.2f}")
-m3.metric("Predicted PM10", f"{pred_pm10:.2f}")
-m4.metric("PM2.5 Risk", risk)
+level_pm25 = pollution_level(pred_pm25)
+level_pm10 = pollution_level(pred_pm10)
 
-if risk == "Unhealthy":
+summary_cols = st.columns(3)
+summary_cols[0].metric("Selected Model", model_choice)
+summary_cols[1].metric("PM2.5 Severity", level_pm25["label"])
+summary_cols[2].metric("PM10 Severity", level_pm10["label"])
+
+card1, card2 = st.columns(2)
+with card1:
+    st.markdown(pollutant_card("Predicted PM2.5", pred_pm25), unsafe_allow_html=True)
+with card2:
+    st.markdown(pollutant_card("Predicted PM10", pred_pm10), unsafe_allow_html=True)
+
+st.markdown("#### Pollution Severity Gauges")
+st.caption(
+    "The colors follow a common AQI-style communication pattern: green means good, yellow means moderate, "
+    "orange/red means unhealthy, and purple/maroon means very serious pollution. "
+    "In this project, the scale is used as a visual decision-support guide for predicted PM2.5 and PM10 values."
+)
+st.markdown(color_legend_html(), unsafe_allow_html=True)
+
+gauge1, gauge2 = st.columns(2)
+with gauge1:
+    st.pyplot(plot_pollution_gauge(pred_pm25, "PM2.5 Pollution Severity"))
+with gauge2:
+    st.pyplot(plot_pollution_gauge(pred_pm10, "PM10 Pollution Severity"))
+
+if risk in ["Unhealthy", "Very Unhealthy", "Hazardous"]:
     st.error(risk_message(risk))
-elif risk == "Moderate":
+elif risk in ["Moderate", "Unhealthy for Sensitive Groups"]:
     st.warning(risk_message(risk))
 else:
     st.success(risk_message(risk))
 
-st.write("**Suggested administrative action:**", suggested_action(risk))
+st.write("**Suggested administrative action based on PM2.5:**", suggested_action(risk))
 
 with st.expander("Show model input row used for prediction"):
     st.dataframe(scenario_input, use_container_width=True)
