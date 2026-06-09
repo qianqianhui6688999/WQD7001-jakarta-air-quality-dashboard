@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+from sklearn.base import clone
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -17,11 +18,13 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 # =========================================================
-# Jakarta Fire-Air Quality Early Warning Dashboard
-# Based on GA2 notebook modelling logic
-# Targets: PM2.5 and PM10
-# Models: Linear Regression, Ridge Regression, Decision Tree,
-#         Random Forest, Gradient Boosting
+# Jakarta Fire-Air Quality Scenario Prediction Dashboard
+# GA2 Data Product Version 2
+#
+# Main purpose:
+#   Train models using 2023 Jakarta air-quality and Indonesian fire data,
+#   then allow users to input a current/hypothetical fire scenario and
+#   predict expected PM2.5 and PM10 values.
 # =========================================================
 
 YEAR = 2023
@@ -30,8 +33,6 @@ RANDOM_STATE = 42
 AIR_PATH = "ispu_dki_all.csv"
 FIRE_PATH = "fire_archive_SV-C2_744546.csv"
 PROCESSED_PATH = os.path.join("processed_data", "model_dataset_2023.csv")
-MODEL_RESULTS_PATH = os.path.join("outputs", "model_results.csv")
-FEATURE_IMPORTANCE_PATH = os.path.join("outputs", "feature_importance.csv")
 
 POLLUTANTS = ["pm25", "pm10", "so2", "co", "o3", "no2"]
 FIRE_COLS = [
@@ -109,13 +110,24 @@ def risk_message(category):
         "Good": "Predicted PM2.5 is Good. Routine monitoring is sufficient.",
         "Moderate": "Predicted PM2.5 is Moderate. Sensitive groups should pay attention.",
         "Unhealthy": "Predicted PM2.5 is Unhealthy. Increase monitoring and prepare public health advisory.",
-        "Not available": "PM2.5 prediction is not available for this selected record."
+        "Not available": "PM2.5 prediction is not available."
     }
     return messages.get(category, "Risk category unavailable.")
 
 
+def suggested_action(category):
+    if category == "Good":
+        return "Routine monitoring. No special public warning is required."
+    if category == "Moderate":
+        return "Continue monitoring. Prepare advisory messages for sensitive groups."
+    if category == "Unhealthy":
+        return "Increase monitoring frequency, prepare public health advisory, and coordinate with related agencies."
+    return "Prediction is not available."
+
+
 @st.cache_data(show_spinner=False)
 def build_dataset_from_raw():
+    """Build the processed modelling dataset if raw CSV files are available."""
     if not (os.path.exists(AIR_PATH) and os.path.exists(FIRE_PATH)):
         return None
 
@@ -194,23 +206,53 @@ def build_dataset_from_raw():
     df = df.merge(daily_fire, on="date", how="left")
     df[FIRE_COLS] = df[FIRE_COLS].fillna(0)
 
-    # Feature engineering
-    df["month"] = df["date"].dt.month
-    df["dayofyear"] = df["date"].dt.dayofyear
-    df["fire_season"] = df["month"].isin([8, 9, 10]).astype(int)
-
-    for lag in [1, 2, 3, 7]:
-        df[f"fire_count_lag{lag}"] = df["fire_count"].shift(lag).fillna(0)
-        df[f"total_frp_lag{lag}"] = df["total_frp"].shift(lag).fillna(0)
-        df[f"high_fire_count_lag{lag}"] = df["high_fire_count"].shift(lag).fillna(0)
-
-    for window in [3, 7, 14]:
-        df[f"fire_count_roll{window}"] = df["fire_count"].rolling(window, min_periods=1).mean()
-        df[f"total_frp_roll{window}"] = df["total_frp"].rolling(window, min_periods=1).mean()
-        df[f"high_fire_count_roll{window}"] = df["high_fire_count"].rolling(window, min_periods=1).mean()
+    df = add_missing_features(df)
 
     os.makedirs("processed_data", exist_ok=True)
     df.to_csv(PROCESSED_PATH, index=False)
+    return df
+
+
+def add_missing_features(df):
+    """Ensure the modelling dataset contains all engineered features."""
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # Support alternative naming from earlier exploratory notebooks.
+    if "mean_frp" in df.columns and "avg_frp" not in df.columns:
+        df["avg_frp"] = df["mean_frp"]
+
+    for col in FIRE_COLS:
+        if col not in df.columns:
+            df[col] = 0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    if "month" not in df.columns:
+        df["month"] = df["date"].dt.month
+    if "dayofyear" not in df.columns:
+        df["dayofyear"] = df["date"].dt.dayofyear
+    if "fire_season" not in df.columns:
+        df["fire_season"] = df["month"].isin([8, 9, 10]).astype(int)
+
+    for lag in [1, 2, 3, 7]:
+        if f"fire_count_lag{lag}" not in df.columns:
+            df[f"fire_count_lag{lag}"] = df["fire_count"].shift(lag).fillna(0)
+        if f"total_frp_lag{lag}" not in df.columns:
+            df[f"total_frp_lag{lag}"] = df["total_frp"].shift(lag).fillna(0)
+        if f"high_fire_count_lag{lag}" not in df.columns:
+            df[f"high_fire_count_lag{lag}"] = df["high_fire_count"].shift(lag).fillna(0)
+
+    for window in [3, 7, 14]:
+        if f"fire_count_roll{window}" not in df.columns:
+            df[f"fire_count_roll{window}"] = df["fire_count"].rolling(window, min_periods=1).mean()
+        if f"total_frp_roll{window}" not in df.columns:
+            df[f"total_frp_roll{window}"] = df["total_frp"].rolling(window, min_periods=1).mean()
+        if f"high_fire_count_roll{window}" not in df.columns:
+            df[f"high_fire_count_roll{window}"] = df["high_fire_count"].rolling(window, min_periods=1).mean()
+
+    for col in FEATURE_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
     return df
 
 
@@ -221,7 +263,7 @@ def load_dataset():
         if os.path.exists(path):
             df = pd.read_csv(path)
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            return df
+            return add_missing_features(df)
     return build_dataset_from_raw()
 
 
@@ -238,8 +280,8 @@ def evaluate_models(df, target_col):
     results = []
     preds = {}
 
-    for model_name, model in MODEL_DEFINITIONS.items():
-        fitted = model.fit(X_train, y_train)
+    for model_name, model_template in MODEL_DEFINITIONS.items():
+        fitted = clone(model_template).fit(X_train, y_train)
         y_pred = fitted.predict(X_test)
         results.append({
             "target": target_col,
@@ -264,20 +306,13 @@ def fit_full_model(df, target_col, model_name):
     model_data = df.dropna(subset=[target_col]).copy()
     X = model_data[FEATURE_COLS]
     y = model_data[target_col]
-    model = MODEL_DEFINITIONS[model_name]
+    model = clone(MODEL_DEFINITIONS[model_name])
     model.fit(X, y)
     return model
 
 
-def predict_for_all_dates(df, target_col, model_name):
-    model = fit_full_model(df, target_col, model_name)
-    pred = model.predict(df[FEATURE_COLS])
-    return pred
-
-
 def get_rf_feature_importance(df, target_col):
-    model_name = "Random Forest"
-    model = fit_full_model(df, target_col, model_name)
+    model = fit_full_model(df, target_col, "Random Forest")
     rf = model.named_steps["model"]
     imp = pd.DataFrame({
         "feature": FEATURE_COLS,
@@ -304,27 +339,82 @@ def plot_feature_importance(importance_df, target_label):
     fig, ax = plt.subplots(figsize=(7, 4.8))
     ax.barh(top["feature"], top["importance"])
     ax.set_xlabel("Feature Importance")
-    ax.set_title(f"Top 10 Feature Importance for {target_label}")
+    ax.set_title(f"Top 10 Random Forest Feature Importance for {target_label}")
     fig.tight_layout()
     return fig
 
 
+def historical_percentile_defaults(df):
+    """Create reasonable default values using the training dataset."""
+    fire_season_df = df[df["fire_season"] == 1].copy()
+    base = fire_season_df if not fire_season_df.empty else df
+
+    defaults = {}
+    for col in FIRE_COLS:
+        defaults[col] = float(base[col].quantile(0.75)) if col in base.columns else 0.0
+    defaults["month"] = 9
+    defaults["dayofyear"] = 260
+    defaults["fire_season"] = 1
+    return defaults
+
+
+def build_scenario_input(values, mode="Simple"):
+    """Convert user inputs into one row with exactly the required modelling features."""
+    row = {
+        "fire_count": values["fire_count"],
+        "total_frp": values["total_frp"],
+        "avg_frp": values["avg_frp"],
+        "max_frp": values["max_frp"],
+        "low_fire_count": values["low_fire_count"],
+        "medium_fire_count": values["medium_fire_count"],
+        "high_fire_count": values["high_fire_count"],
+        "month": values["month"],
+        "dayofyear": values["dayofyear"],
+        "fire_season": values["fire_season"],
+    }
+
+    if mode == "Advanced":
+        for col in [
+            "fire_count_lag1", "fire_count_lag2", "fire_count_lag3", "fire_count_lag7",
+            "total_frp_lag1", "total_frp_lag2", "total_frp_lag3", "total_frp_lag7",
+            "high_fire_count_lag1", "high_fire_count_lag2", "high_fire_count_lag3", "high_fire_count_lag7",
+            "fire_count_roll3", "fire_count_roll7", "fire_count_roll14",
+            "total_frp_roll3", "total_frp_roll7", "total_frp_roll14",
+            "high_fire_count_roll3", "high_fire_count_roll7", "high_fire_count_roll14",
+        ]:
+            row[col] = values[col]
+    else:
+        # Simple mode: use the current input as a proxy for recent lag/rolling values.
+        # This makes the prototype easy for non-technical users while keeping the
+        # feature structure consistent with the 31-predictor training model.
+        for lag in [1, 2, 3, 7]:
+            row[f"fire_count_lag{lag}"] = values["fire_count"]
+            row[f"total_frp_lag{lag}"] = values["total_frp"]
+            row[f"high_fire_count_lag{lag}"] = values["high_fire_count"]
+        for window in [3, 7, 14]:
+            row[f"fire_count_roll{window}"] = values["fire_count"]
+            row[f"total_frp_roll{window}"] = values["total_frp"]
+            row[f"high_fire_count_roll{window}"] = values["high_fire_count"]
+
+    return pd.DataFrame([row])[FEATURE_COLS]
+
+
 # ========================= Streamlit UI =========================
 st.set_page_config(
-    page_title="Jakarta Fire-Air Quality Early Warning Dashboard",
+    page_title="Jakarta Fire-Air Quality Scenario Prediction Dashboard",
     page_icon="🔥",
     layout="wide"
 )
 
-st.title("🔥 Jakarta Fire-Air Quality Early Warning Dashboard")
+st.title("🔥 Jakarta Fire-Air Quality Scenario Prediction Dashboard")
 st.caption(
-    "This dashboard converts GA2 regression modelling results into a simple decision-support prototype "
-    "for monitoring Indonesian fire activity and Jakarta particulate pollution risk."
+    "This data product trains regression models using the 2023 Jakarta air-quality and Indonesian fire dataset. "
+    "Users can input current or hypothetical fire indicators to predict expected PM2.5 and PM10 levels."
 )
 
 with st.sidebar:
     st.header("Dashboard Controls")
-    st.write("Jakarta Air Quality and Indonesian Fire Activity, 2023")
+    st.write("GA2 data product: scenario-based PM2.5 and PM10 prediction")
 
     df = load_dataset()
 
@@ -335,55 +425,120 @@ with st.sidebar:
         )
         st.stop()
 
-    target_choice = st.selectbox("Select pollutant target", ["pm25", "pm10"], format_func=lambda x: x.upper())
     model_choice = st.selectbox(
-        "Select model for daily prediction",
+        "Select prediction model",
         list(MODEL_DEFINITIONS.keys()),
         index=list(MODEL_DEFINITIONS.keys()).index("Random Forest")
     )
 
-    available_dates = df["date"].dropna().sort_values().dt.date.tolist()
-    selected_date = st.date_input(
-        "Select a date",
-        value=available_dates[-1],
-        min_value=available_dates[0],
-        max_value=available_dates[-1]
+    input_mode = st.radio(
+        "Input mode",
+        ["Simple", "Advanced"],
+        help="Simple mode only asks for main fire indicators. Advanced mode allows lag and rolling features."
     )
 
-    season_filter = st.selectbox("Season filter", ["All", "Fire Season", "Non-Fire Season"])
-    show_table = st.checkbox("Show selected-date data table", value=False)
+    show_historical = st.checkbox("Show historical training-data explorer", value=True)
 
-# Prepare data
-working_df = df.copy()
-working_df["pred_pm25"] = predict_for_all_dates(working_df, "pm25", model_choice)
-working_df["pred_pm10"] = predict_for_all_dates(working_df, "pm10", model_choice)
-working_df["pred_pm25_risk"] = working_df["pred_pm25"].apply(pm25_risk_category)
-working_df["season_group"] = np.where(working_df["fire_season"] == 1, "Fire Season", "Non-Fire Season")
+# Train models for the selected model type.
+pm25_model = fit_full_model(df, "pm25", model_choice)
+pm10_model = fit_full_model(df, "pm10", model_choice)
 
-if season_filter != "All":
-    display_df = working_df[working_df["season_group"] == season_filter].copy()
-else:
-    display_df = working_df.copy()
+defaults = historical_percentile_defaults(df)
 
-selected_ts = pd.to_datetime(selected_date)
-selected_rows = working_df[working_df["date"].dt.date == selected_date]
+# ========================= Section 1: Scenario prediction =========================
+st.subheader("1. Scenario Prediction Tool")
+st.write(
+    "Enter current or hypothetical Indonesian fire-activity indicators. The selected model will estimate "
+    "Jakarta PM2.5 and PM10. The PM2.5 prediction is also translated into a risk category."
+)
 
-if selected_rows.empty:
-    st.warning("No record is available for the selected date.")
-    st.stop()
+with st.form("scenario_form"):
+    st.markdown("**Main fire indicators**")
+    c1, c2, c3, c4 = st.columns(4)
+    fire_count = c1.number_input("Fire Count", min_value=0.0, value=round(defaults["fire_count"], 2), step=10.0)
+    total_frp = c2.number_input("Total FRP", min_value=0.0, value=round(defaults["total_frp"], 2), step=100.0)
+    avg_frp = c3.number_input("Average FRP", min_value=0.0, value=round(defaults["avg_frp"], 2), step=1.0)
+    max_frp = c4.number_input("Maximum FRP", min_value=0.0, value=round(defaults["max_frp"], 2), step=5.0)
 
-row = selected_rows.iloc[0]
-risk = row["pred_pm25_risk"]
+    c5, c6, c7 = st.columns(3)
+    low_fire_count = c5.number_input("Low Fire Count", min_value=0.0, value=round(defaults["low_fire_count"], 2), step=10.0)
+    medium_fire_count = c6.number_input("Medium Fire Count", min_value=0.0, value=round(defaults["medium_fire_count"], 2), step=10.0)
+    high_fire_count = c7.number_input("High Fire Count", min_value=0.0, value=round(defaults["high_fire_count"], 2), step=10.0)
 
-# Section 1: Daily overview
-st.subheader("1. Daily Overview")
-metric_cols = st.columns(6)
-metric_cols[0].metric("Selected Date", selected_date.strftime("%Y-%m-%d"))
-metric_cols[1].metric("Fire Count", f"{row['fire_count']:.0f}")
-metric_cols[2].metric("Total FRP", f"{row['total_frp']:.1f}")
-metric_cols[3].metric("Predicted PM2.5", f"{row['pred_pm25']:.2f}")
-metric_cols[4].metric("Predicted PM10", f"{row['pred_pm10']:.2f}")
-metric_cols[5].metric("PM2.5 Risk", risk)
+    st.markdown("**Seasonal information**")
+    c8, c9, c10 = st.columns(3)
+    month = c8.slider("Month", 1, 12, int(defaults["month"]))
+    dayofyear = c9.slider("Day of Year", 1, 366, int(defaults["dayofyear"]))
+    fire_season_text = c10.selectbox("Fire Season", ["Yes", "No"], index=0)
+    fire_season = 1 if fire_season_text == "Yes" else 0
+
+    values = {
+        "fire_count": fire_count,
+        "total_frp": total_frp,
+        "avg_frp": avg_frp,
+        "max_frp": max_frp,
+        "low_fire_count": low_fire_count,
+        "medium_fire_count": medium_fire_count,
+        "high_fire_count": high_fire_count,
+        "month": month,
+        "dayofyear": dayofyear,
+        "fire_season": fire_season,
+    }
+
+    if input_mode == "Advanced":
+        st.markdown("**Lag features: previous fire activity**")
+        st.caption("Use these fields when recent fire activity is available. Otherwise, use Simple mode.")
+        lag_tabs = st.tabs(["Fire Count Lags", "Total FRP Lags", "High Fire Count Lags"])
+        with lag_tabs[0]:
+            l1, l2, l3, l7 = st.columns(4)
+            values["fire_count_lag1"] = l1.number_input("Fire Count Lag 1", min_value=0.0, value=fire_count, step=10.0)
+            values["fire_count_lag2"] = l2.number_input("Fire Count Lag 2", min_value=0.0, value=fire_count, step=10.0)
+            values["fire_count_lag3"] = l3.number_input("Fire Count Lag 3", min_value=0.0, value=fire_count, step=10.0)
+            values["fire_count_lag7"] = l7.number_input("Fire Count Lag 7", min_value=0.0, value=fire_count, step=10.0)
+        with lag_tabs[1]:
+            l1, l2, l3, l7 = st.columns(4)
+            values["total_frp_lag1"] = l1.number_input("Total FRP Lag 1", min_value=0.0, value=total_frp, step=100.0)
+            values["total_frp_lag2"] = l2.number_input("Total FRP Lag 2", min_value=0.0, value=total_frp, step=100.0)
+            values["total_frp_lag3"] = l3.number_input("Total FRP Lag 3", min_value=0.0, value=total_frp, step=100.0)
+            values["total_frp_lag7"] = l7.number_input("Total FRP Lag 7", min_value=0.0, value=total_frp, step=100.0)
+        with lag_tabs[2]:
+            l1, l2, l3, l7 = st.columns(4)
+            values["high_fire_count_lag1"] = l1.number_input("High Fire Count Lag 1", min_value=0.0, value=high_fire_count, step=10.0)
+            values["high_fire_count_lag2"] = l2.number_input("High Fire Count Lag 2", min_value=0.0, value=high_fire_count, step=10.0)
+            values["high_fire_count_lag3"] = l3.number_input("High Fire Count Lag 3", min_value=0.0, value=high_fire_count, step=10.0)
+            values["high_fire_count_lag7"] = l7.number_input("High Fire Count Lag 7", min_value=0.0, value=high_fire_count, step=10.0)
+
+        st.markdown("**Rolling features: cumulative recent fire activity**")
+        r_tabs = st.tabs(["Fire Count Rolling", "Total FRP Rolling", "High Fire Count Rolling"])
+        with r_tabs[0]:
+            r3, r7, r14 = st.columns(3)
+            values["fire_count_roll3"] = r3.number_input("Fire Count Rolling 3-Day", min_value=0.0, value=fire_count, step=10.0)
+            values["fire_count_roll7"] = r7.number_input("Fire Count Rolling 7-Day", min_value=0.0, value=fire_count, step=10.0)
+            values["fire_count_roll14"] = r14.number_input("Fire Count Rolling 14-Day", min_value=0.0, value=fire_count, step=10.0)
+        with r_tabs[1]:
+            r3, r7, r14 = st.columns(3)
+            values["total_frp_roll3"] = r3.number_input("Total FRP Rolling 3-Day", min_value=0.0, value=total_frp, step=100.0)
+            values["total_frp_roll7"] = r7.number_input("Total FRP Rolling 7-Day", min_value=0.0, value=total_frp, step=100.0)
+            values["total_frp_roll14"] = r14.number_input("Total FRP Rolling 14-Day", min_value=0.0, value=total_frp, step=100.0)
+        with r_tabs[2]:
+            r3, r7, r14 = st.columns(3)
+            values["high_fire_count_roll3"] = r3.number_input("High Fire Count Rolling 3-Day", min_value=0.0, value=high_fire_count, step=10.0)
+            values["high_fire_count_roll7"] = r7.number_input("High Fire Count Rolling 7-Day", min_value=0.0, value=high_fire_count, step=10.0)
+            values["high_fire_count_roll14"] = r14.number_input("High Fire Count Rolling 14-Day", min_value=0.0, value=high_fire_count, step=10.0)
+
+    predict_clicked = st.form_submit_button("Predict PM2.5 and PM10")
+
+scenario_input = build_scenario_input(values, input_mode)
+pred_pm25 = float(pm25_model.predict(scenario_input)[0])
+pred_pm10 = float(pm10_model.predict(scenario_input)[0])
+risk = pm25_risk_category(pred_pm25)
+
+st.markdown("### Prediction Output")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Selected Model", model_choice)
+m2.metric("Predicted PM2.5", f"{pred_pm25:.2f}")
+m3.metric("Predicted PM10", f"{pred_pm10:.2f}")
+m4.metric("PM2.5 Risk", risk)
 
 if risk == "Unhealthy":
     st.error(risk_message(risk))
@@ -392,89 +547,120 @@ elif risk == "Moderate":
 else:
     st.success(risk_message(risk))
 
-if show_table:
-    selected_cols = [
-        "date", "fire_count", "total_frp", "avg_frp", "max_frp",
-        "pm25", "pm10", "pred_pm25", "pred_pm10", "pred_pm25_risk"
-    ]
-    st.dataframe(selected_rows[selected_cols], use_container_width=True)
+st.write("**Suggested administrative action:**", suggested_action(risk))
 
-# Section 2: Trends
-st.subheader("2. Daily Trend Monitoring")
-left, right = st.columns(2)
-with left:
-    st.write("**Fire Activity Trend: Fire Count and Total FRP**")
-    trend_fire = display_df.set_index("date")[["fire_count", "total_frp"]]
-    st.line_chart(trend_fire)
+with st.expander("Show model input row used for prediction"):
+    st.dataframe(scenario_input, use_container_width=True)
 
-with right:
-    st.write("**Observed and Predicted PM2.5 / PM10**")
-    trend_air_cols = ["pm25", "pm10", "pred_pm25", "pred_pm10"]
-    trend_air = display_df.set_index("date")[trend_air_cols]
-    st.line_chart(trend_air)
-
-# Section 3: Seasonal comparison
-st.subheader("3. Fire Season vs Non-Fire Season Comparison")
-season_summary = (
-    working_df.groupby("season_group")
-    .agg(
-        mean_pm25=("pm25", "mean"),
-        mean_pm10=("pm10", "mean"),
-        mean_fire_count=("fire_count", "mean"),
-        unhealthy_pm25_days=("pred_pm25_risk", lambda x: (x == "Unhealthy").mean() * 100)
-    )
-    .reset_index()
+st.info(
+    "Prototype note: Simple mode automatically uses the current fire indicators as proxies for lag and rolling features. "
+    "For a more realistic operational use case, choose Advanced mode and enter recent historical fire activity values."
 )
 
-c1, c2 = st.columns(2)
-with c1:
-    st.write("**Average PM2.5 and PM10 by Season**")
-    st.bar_chart(season_summary.set_index("season_group")[["mean_pm25", "mean_pm10"]])
-with c2:
-    st.write("**Percentage of Predicted Unhealthy PM2.5 Days by Season**")
-    st.bar_chart(season_summary.set_index("season_group")[["unhealthy_pm25_days"]])
-st.dataframe(season_summary, use_container_width=True)
+# ========================= Section 2: Model performance =========================
+st.subheader("2. Model Performance on 2023 Training Data")
+st.write("This section explains how the candidate models performed during GA2 modelling.")
 
-# Section 4: Model performance
-st.subheader("4. Model Performance and Prediction Output")
-results_df, pred_dict = evaluate_models(working_df, target_choice)
-target_label = target_choice.upper()
+pm25_results, pm25_preds = evaluate_models(df, "pm25")
+pm10_results, pm10_preds = evaluate_models(df, "pm10")
 
-m1, m2 = st.columns([1, 1])
-with m1:
-    st.write(f"**Model Evaluation for {target_label}**")
+p1, p2 = st.columns(2)
+with p1:
+    st.write("**PM2.5 Model Evaluation**")
     st.dataframe(
-        results_df.assign(
-            R2=results_df["R2"].round(3),
-            MAE=results_df["MAE"].round(2),
-            RMSE=results_df["RMSE"].round(2)
+        pm25_results.assign(
+            R2=pm25_results["R2"].round(3),
+            MAE=pm25_results["MAE"].round(2),
+            RMSE=pm25_results["RMSE"].round(2)
         ),
         use_container_width=True
     )
+    st.bar_chart(pm25_results.set_index("model")[["R2"]])
+with p2:
+    st.write("**PM10 Model Evaluation**")
+    st.dataframe(
+        pm10_results.assign(
+            R2=pm10_results["R2"].round(3),
+            MAE=pm10_results["MAE"].round(2),
+            RMSE=pm10_results["RMSE"].round(2)
+        ),
+        use_container_width=True
+    )
+    st.bar_chart(pm10_results.set_index("model")[["R2"]])
 
-    st.write(f"**Model R² Comparison for {target_label}**")
-    st.bar_chart(results_df.set_index("model")[["R2"]])
+ap1, ap2 = st.columns(2)
+with ap1:
+    best_pm25 = pm25_results.iloc[0]["model"]
+    st.pyplot(plot_actual_vs_predicted(pm25_preds[best_pm25], "PM2.5", best_pm25))
+with ap2:
+    best_pm10 = pm10_results.iloc[0]["model"]
+    st.pyplot(plot_actual_vs_predicted(pm10_preds[best_pm10], "PM10", best_pm10))
 
-with m2:
-    best_name = results_df.iloc[0]["model"]
-    st.write(f"**Actual vs Predicted: {target_label} ({best_name})**")
-    st.pyplot(plot_actual_vs_predicted(pred_dict[best_name], target_label, best_name))
+# ========================= Section 3: Feature explanation =========================
+st.subheader("3. Model Explanation: Random Forest Feature Importance")
+fi1, fi2 = st.columns(2)
+with fi1:
+    pm25_imp = get_rf_feature_importance(df, "pm25")
+    st.pyplot(plot_feature_importance(pm25_imp, "PM2.5"))
+with fi2:
+    pm10_imp = get_rf_feature_importance(df, "pm10")
+    st.pyplot(plot_feature_importance(pm10_imp, "PM10"))
 
-# Section 5: Feature explanation
-st.subheader("5. Model Explanation: Feature Importance")
-st.write(
-    "Feature importance is shown for Random Forest because it is the main interpretable ensemble model "
-    "used in the GA2 modelling design."
-)
-importance_df = get_rf_feature_importance(working_df, target_choice)
-fi_left, fi_right = st.columns([1, 1])
-with fi_left:
-    st.pyplot(plot_feature_importance(importance_df, target_label))
-with fi_right:
-    st.dataframe(importance_df.head(15), use_container_width=True)
+with st.expander("Top feature importance tables"):
+    t1, t2 = st.columns(2)
+    with t1:
+        st.write("**PM2.5**")
+        st.dataframe(pm25_imp.head(15), use_container_width=True)
+    with t2:
+        st.write("**PM10**")
+        st.dataframe(pm10_imp.head(15), use_container_width=True)
+
+# ========================= Section 4: Historical explorer =========================
+if show_historical:
+    st.subheader("4. Historical Training-Data Explorer")
+    st.write(
+        "This part is for explaining the 2023 data used to train the models. It is not the main prediction input."
+    )
+
+    df_hist = df.copy()
+    df_hist["season_group"] = np.where(df_hist["fire_season"] == 1, "Fire Season", "Non-Fire Season")
+
+    season_filter = st.selectbox("Historical season filter", ["All", "Fire Season", "Non-Fire Season"])
+    if season_filter != "All":
+        display_df = df_hist[df_hist["season_group"] == season_filter].copy()
+    else:
+        display_df = df_hist.copy()
+
+    h1, h2 = st.columns(2)
+    with h1:
+        st.write("**Fire Activity Trend: Fire Count and Total FRP**")
+        st.line_chart(display_df.set_index("date")[["fire_count", "total_frp"]])
+    with h2:
+        st.write("**Observed PM2.5 and PM10 Trend**")
+        st.line_chart(display_df.set_index("date")[["pm25", "pm10"]])
+
+    season_summary = (
+        df_hist.groupby("season_group")
+        .agg(
+            mean_pm25=("pm25", "mean"),
+            mean_pm10=("pm10", "mean"),
+            mean_fire_count=("fire_count", "mean"),
+            observed_unhealthy_pm25_days=("pm25", lambda x: (x > 100).mean() * 100)
+        )
+        .reset_index()
+    )
+
+    s1, s2 = st.columns(2)
+    with s1:
+        st.write("**Average PM2.5 and PM10 by Season**")
+        st.bar_chart(season_summary.set_index("season_group")[["mean_pm25", "mean_pm10"]])
+    with s2:
+        st.write("**Observed Unhealthy PM2.5 Days by Season (%)**")
+        st.bar_chart(season_summary.set_index("season_group")[["observed_unhealthy_pm25_days"]])
+    st.dataframe(season_summary, use_container_width=True)
 
 st.info(
-    "Limitation note: This dashboard is an early-warning aid, not a complete official warning system. "
+    "Limitation note: This dashboard is an early-warning decision-support prototype, not a complete official warning system. "
     "The current model uses fire activity, lagged fire indicators, rolling fire indicators, and seasonal variables. "
     "Wind direction, rainfall, atmospheric transport, traffic emissions, industrial emissions, and health outcome data are not included."
 )
